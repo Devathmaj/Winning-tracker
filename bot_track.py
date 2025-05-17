@@ -24,13 +24,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 OWO_BOT_ID = 408785106942164992
 
 active_sessions = {}
+pending_bets = {}  # To track bets waiting for results
 
 amount_pattern = re.compile(r"(\d{1,3}(?:,\d{3})*|\d+)")
 
-def extract_last_amount(text):
+def extract_amount(text):
     text = text.replace(",", "")
     amounts = amount_pattern.findall(text)
-    return int(amounts[-1]) if amounts else None
+    return int(amounts[0]) if amounts else None
 
 @bot.event
 async def on_ready():
@@ -48,9 +49,9 @@ async def initialize(interaction: discord.Interaction):
         await interaction.response.send_message("You already have an active session. Use /result to finish it.", ephemeral=True)
         return
     active_sessions[user_id] = {
-        "bets": [],
-        "winnings": [],
-        "lost": [],
+        "total_won": 0,
+        "total_lost": 0,
+        "net_gain": 0,
         "start_time": datetime.datetime.now(datetime.timezone.utc)
     }
     await interaction.response.send_message("New session started! Tracking initialized.", ephemeral=True)
@@ -62,98 +63,133 @@ async def result(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have an active session. Use /initialize to start one.", ephemeral=True)
         return
     session = active_sessions.pop(user_id)
-    total_bet = sum(session.get("bets", []))
-    total_win = sum(session.get("winnings", []))
-    total_loss = sum(session.get("lost", []))
-    net = total_win - total_bet
     await sessions_collection.insert_one({
         "user_id": str(user_id),
         "start_time": session["start_time"],
         "end_time": datetime.datetime.now(datetime.timezone.utc),
-        "total_bet": total_bet,
-        "total_win": total_win,
-        "total_loss": total_loss,
-        "net_gain": net
+        "total_won": session["total_won"],
+        "total_lost": session["total_lost"],
+        "net_gain": session["net_gain"]
     })
     await interaction.response.send_message(
-        f"**Session Result:**\nLost: `{total_loss:,}`\nWon: `{total_win:,}`\nNet: `{net:,}`"
+        f"**Session Result:**\nTotal Lost: `{session['total_lost']:,}`\nTotal Won (Net Profit): `{session['total_won']:,}`\nNet Gain: `{session['net_gain']:,}`"
     )
 
 @bot.event
 async def on_message(message):
+    await bot.process_commands(message)
+
     if message.author.id != OWO_BOT_ID:
         return
 
-    content = message.content.lower().replace(",", "")
+    content = message.content
     embeds = message.embeds
-
     target_user_id = None
     if message.mentions:
-        for user in message.mentions:
-            if user.id != OWO_BOT_ID:
-                target_user_id = user.id
-                break
+        target_user_id = message.mentions[0].id if message.mentions[0].id != OWO_BOT_ID else None
 
-    if target_user_id is None:
-        return
-    if target_user_id not in active_sessions:
+    if not target_user_id or target_user_id not in active_sessions:
         return
 
     session = active_sessions[target_user_id]
 
-    if "spent :cowoncy:" in content and "chose" in content and "the coin spins" in content:
-        bet = extract_last_amount(content)
-        if bet is not None:
-            if "you won" in content:
-                session["bets"].append(bet)
-                session["winnings"].append(bet * 2)
-            elif "you lost it all" in content:
-                session["bets"].append(bet)
-                session["lost"].append(bet)
+    # COINFLIP
+    if "spent :cowoncy:" in content and "chose" in content:
+        bet_amount = extract_amount(content)
+        if bet_amount:
+            pending_bets[target_user_id] = {
+                "game": "coinflip",
+                "amount": bet_amount,
+                "time": datetime.datetime.now(datetime.timezone.utc)
+            }
+            print(f"[Coinflip] Bet Placed: {bet_amount}")
         return
 
-    if "___slots___" in content or "slots" in content:
-        bet = None
-        won = None
-        bet_search = re.search(r"bet\s*:cowoncy:\s*(\d+(?:,\d{3})*)", content)
-        if bet_search:
-            bet = int(bet_search.group(1).replace(",", ""))
-        won_search = re.search(r"and won(?:\s*:cowoncy:\s*(\d+(?:,\d{3})*))?", content)
-        if won_search:
-            if won_search.group(1):
-                won = int(won_search.group(1).replace(",", ""))
-            else:
-                won = 0
-        if bet is not None and won is not None:
-            if won == 0:
-                return
-            elif won == bet:
-                return
-            elif won > bet:
-                session["bets"].append(bet)
-                session["winnings"].append(won - bet)
-                return
+    if "the coin spins" in content:
+        if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "coinflip":
+            bet_info = pending_bets[target_user_id]
+            if "you lost it all" in content:
+                session["total_lost"] += bet_info["amount"]
+                print(f"[Coinflip] Lost: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
+            elif "you won" in content:
+                session["total_won"] += bet_info["amount"]
+                print(f"[Coinflip] Won: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
+            session["net_gain"] = session["total_won"] - session["total_lost"]
+            pending_bets.pop(target_user_id, None)
         return
 
+    # SLOTS
+    if "___SLOTS___" in content and "bet :cowoncy:" in content:
+        bet_amount = extract_amount(content)
+        if bet_amount:
+            pending_bets[target_user_id] = {
+                "game": "slots",
+                "amount": bet_amount,
+                "time": datetime.datetime.now(datetime.timezone.utc)
+            }
+            print(f"[Slots] Bet Placed: {bet_amount}")
+        return
+
+    if "and won :cowoncy:" in content:
+        if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "slots":
+            bet_info = pending_bets[target_user_id]
+            won_amount = extract_amount(content)
+            if won_amount:
+                net_profit = won_amount - bet_info["amount"]
+                session["total_won"] += net_profit
+                print(f"[Slots] Won: {net_profit} (Bet: {bet_info['amount']}, Total: {won_amount}) | Net: {session['total_won'] - session['total_lost']}")
+                session["net_gain"] = session["total_won"] - session["total_lost"]
+                pending_bets.pop(target_user_id, None)
+        return
+
+    if "and lost it all" in content:
+        if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "slots":
+            bet_info = pending_bets[target_user_id]
+            session["total_lost"] += bet_info["amount"]
+            print(f"[Slots] Lost: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
+            session["net_gain"] = session["total_won"] - session["total_lost"]
+            pending_bets.pop(target_user_id, None)
+        return
+
+    # BLACKJACK
     if embeds:
         for embed in embeds:
-            desc = embed.description.lower().replace(",", "") if embed.description else ""
-            foot = embed.footer.text.lower().replace(",", "") if embed.footer and embed.footer.text else ""
-            bet = None
-            bet_search = re.search(r"you bet (\d+(?:,\d{3})*) to play blackjack", desc)
-            if bet_search:
-                bet = int(bet_search.group(1).replace(",", ""))
-            if bet is None:
-                continue
-            if "you won" in foot:
-                session["bets"].append(bet)
-                session["winnings"].append(bet * 2)
+            description = embed.description or ""
+            footer = embed.footer.text if embed.footer else ""
+
+            if "you bet" in description.lower() and "to play blackjack" in description.lower():
+                bet_amount = extract_amount(description)
+                if bet_amount:
+                    pending_bets[target_user_id] = {
+                        "game": "blackjack",
+                        "amount": bet_amount,
+                        "time": datetime.datetime.now(datetime.timezone.utc)
+                    }
+                    print(f"[Blackjack] Bet Placed: {bet_amount}")
                 return
-            elif "you lost" in foot:
-                session["bets"].append(bet)
-                session["lost"].append(bet)
+
+            if "you won" in footer.lower():
+                if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "blackjack":
+                    net_profit = extract_amount(footer)
+                    if net_profit is not None:
+                        session["total_won"] += net_profit
+                        print(f"[Blackjack] Won: {net_profit} | Net: {session['total_won'] - session['total_lost']}")
+                        session["net_gain"] = session["total_won"] - session["total_lost"]
+                        pending_bets.pop(target_user_id, None)
                 return
-            elif "you tied" in foot or "you both bust" in foot:
+
+            if "you lost" in footer.lower():
+                if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "blackjack":
+                    bet_info = pending_bets[target_user_id]
+                    session["total_lost"] += bet_info["amount"]
+                    print(f"[Blackjack] Lost: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
+                    session["net_gain"] = session["total_won"] - session["total_lost"]
+                    pending_bets.pop(target_user_id, None)
+                return
+
+            if "you tied" in footer.lower() or "you both bust" in footer.lower():
+                pending_bets.pop(target_user_id, None)
+                print("[Blackjack] Tie or Bust - No Change")
                 return
 
 bot.run(DISCORD_TOKEN)
