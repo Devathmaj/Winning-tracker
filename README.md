@@ -33,12 +33,6 @@ A Discord bot that tracks mini-game results from the popular OwO bot (coinflip, 
 ---
 
 
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
----
-
 ## Contact
 
 Developed by [Your Name](https://github.com/Devathmaj).  
