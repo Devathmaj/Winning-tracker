@@ -1,195 +1,191 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
+import asyncio
 import re
-import datetime
-from motor.motor_asyncio import AsyncIOMotorClient
+import logging
+from pymongo import MongoClient
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
-MONGO_URI = os.getenv("MONGO_URI")
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-mongo_client = AsyncIOMotorClient(MONGO_URI)
+BOT_TOKEN = os.getenv("DISCORD_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+BOT_USER_ID = 408785106942164992
+MSG_LOG_WORDS = ["won", "lost", "tied", "bust"]
+TRACKING_INTERVAL = 2
+
+mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["Winningtrack"]
 sessions_collection = db["Sessions"]
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
 intents.messages = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
 
-OWO_BOT_ID = 408785106942164992
+session_data = {
+    "active": False,
+    "channel_id": None,
+    "logged_messages": set(),
+    "gain": 0,
+    "loss": 0,
+    "start_time": None
+}
 
-active_sessions = {}
-pending_bets = {}  # To track bets waiting for results
+def remove_angle_brackets(text):
+    return re.sub(r"<[^>]*>", "", text)
 
-amount_pattern = re.compile(r"(\d{1,3}(?:,\d{3})*|\d+)")
+def extract_amount(pattern, text):
+    cleaned_text = text.replace(",", "")
+    match = re.search(pattern, cleaned_text)
+    return int(match.group(1)) if match else 0
 
-def extract_amount(text):
-    text = text.replace(",", "")
-    amounts = amount_pattern.findall(text)
-    return int(amounts[0]) if amounts else None
+def detect_game_type(cleaned_content: str):
+    if "dealer" in cleaned_content.lower():
+        return "blackjack"
+    elif "bet" in cleaned_content and "dealer" not in cleaned_content:
+        return "slots"
+    elif "spent" in cleaned_content:
+        return "coinflip"
+    return None
+
+def calculate_gain_loss(game_type: str, cleaned_content: str):
+    # Ignore tied or both bust results
+    if "tied" in cleaned_content.lower() or "you both bust" in cleaned_content.lower():
+        return 0, 0
+
+    # Handle Blackjack separately
+    if game_type == "blackjack":
+        win_match = re.search(r"~\s*you won\s*(\d+)\s*cowoncy", cleaned_content, re.IGNORECASE)
+        loss_match = re.search(r"~\s*you lost\s*(\d+)\s*cowoncy", cleaned_content, re.IGNORECASE)
+
+        if win_match:
+            gain = int(win_match.group(1))
+            return gain, 0
+        elif loss_match:
+            loss = int(loss_match.group(1))
+            return 0, loss
+
+        return 0, 0
+
+    # Extract amounts for coinflip and slots
+    bet = extract_amount(r"(?:spent|bet)[^\d]*(\d+)", cleaned_content)
+    won = extract_amount(r"won[^\d]*(\d+)", cleaned_content)
+
+    # Slots: specifically check for 'won nothing'
+    if game_type == "slots" and "won nothing" in cleaned_content.lower():
+        return 0, bet
+
+    # Coinflip or Slots: lost
+    if "lost" in cleaned_content.lower():
+        return 0, bet
+
+    # Coinflip or Slots: won
+    if "won" in cleaned_content.lower():
+        return won - bet, 0  # Net gain = winnings - bet
+
+    return 0, 0
+
+@tree.command(name="initialize", description="Start tracking OwO game messages")
+async def initialize(interaction: discord.Interaction):
+    session_data["active"] = True
+    session_data["channel_id"] = interaction.channel_id
+    session_data["logged_messages"].clear()
+    session_data["gain"] = 0
+    session_data["loss"] = 0
+    session_data["start_time"] = datetime.now(timezone.utc)
+
+    await interaction.response.send_message("Session has started", ephemeral=False)
+    logger.info(f"/initialize received in channel {interaction.channel_id} at {session_data['start_time']}")
+
+@tree.command(name="result", description="End tracking and show session result")
+async def result(interaction: discord.Interaction):
+    session_data["active"] = False
+
+    total_gain = session_data["gain"]
+    total_loss = session_data["loss"]
+    net = total_gain - total_loss
+
+    await interaction.response.send_message(
+        f"Session ended.\nTotal Gain: {total_gain}\nTotal Loss: {total_loss}\nNet: {net}", ephemeral=False
+    )
+
+    sessions_collection.insert_one({
+        "timestamp": datetime.now(timezone.utc),
+        "channel_id": session_data["channel_id"],
+        "gain": total_gain,
+        "loss": total_loss,
+        "net": net
+    })
+
+    session_data["channel_id"] = None
+    session_data["logged_messages"].clear()
+    session_data["gain"] = 0
+    session_data["loss"] = 0
+    session_data["start_time"] = None
+
+    logger.info("Session results saved to MongoDB and session data wiped.")
+
+@tasks.loop(seconds=TRACKING_INTERVAL)
+async def monitor_messages():
+    if not session_data["active"]:
+        return
+
+    channel = bot.get_channel(session_data["channel_id"])
+    if not channel:
+        logger.warning("Invalid channel ID")
+        return
+
+    async for message in channel.history(limit=20):
+        if message.created_at.replace(tzinfo=timezone.utc) < session_data["start_time"]:
+            continue
+
+        if message.author.id != BOT_USER_ID or message.id in session_data["logged_messages"]:
+            continue
+
+        content = message.content or ""
+        if message.embeds:
+            for embed in message.embeds:
+                if embed.title:
+                    content += f"\n{embed.title}"
+                if embed.description:
+                    content += f"\n{embed.description}"
+                if embed.footer and embed.footer.text:
+                    content += f"\n{embed.footer.text}"
+                if embed.fields:
+                    for field in embed.fields:
+                        content += f"\n{field.name} {field.value}"
+
+        cleaned_content = remove_angle_brackets(content).lower()
+
+        if any(word in cleaned_content for word in MSG_LOG_WORDS):
+            session_data["logged_messages"].add(message.id)
+            logger.info("---- Detected OwO Message ----")
+            logger.info(content)
+            logger.info("--------------------------------")
+
+            game_type = detect_game_type(cleaned_content)
+            if game_type:
+                gain, loss = calculate_gain_loss(game_type, cleaned_content)
+                session_data["gain"] += gain
+                session_data["loss"] += loss
+
+                logger.info(f"Updated -> Gain: {session_data['gain']} | Loss: {session_data['loss']} | Net: {session_data['gain'] - session_data['loss']}")
 
 @bot.event
 async def on_ready():
-    print(f"Bot is ready. Logged in as {bot.user}")
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands.")
-    except Exception as e:
-        print(e)
+    await tree.sync()
+    monitor_messages.start()
+    logger.info(f"Bot is ready. Logged in as {bot.user}")
 
-@bot.tree.command(name="initialize", description="Start a new session to track your winnings")
-async def initialize(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    if user_id in active_sessions:
-        await interaction.response.send_message("You already have an active session. Use /result to finish it.", ephemeral=True)
-        return
-    active_sessions[user_id] = {
-        "total_won": 0,
-        "total_lost": 0,
-        "net_gain": 0,
-        "start_time": datetime.datetime.now(datetime.timezone.utc)
-    }
-    await interaction.response.send_message("New session started! Tracking initialized.", ephemeral=True)
-
-@bot.tree.command(name="result", description="End session and show total result")
-async def result(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    if user_id not in active_sessions:
-        await interaction.response.send_message("You don't have an active session. Use /initialize to start one.", ephemeral=True)
-        return
-    session = active_sessions.pop(user_id)
-    await sessions_collection.insert_one({
-        "user_id": str(user_id),
-        "start_time": session["start_time"],
-        "end_time": datetime.datetime.now(datetime.timezone.utc),
-        "total_won": session["total_won"],
-        "total_lost": session["total_lost"],
-        "net_gain": session["net_gain"]
-    })
-    await interaction.response.send_message(
-        f"**Session Result:**\nTotal Lost: `{session['total_lost']:,}`\nTotal Won (Net Profit): `{session['total_won']:,}`\nNet Gain: `{session['net_gain']:,}`"
-    )
-
-@bot.event
-async def on_message(message):
-    await bot.process_commands(message)
-
-    if message.author.id != OWO_BOT_ID:
-        return
-
-    content = message.content
-    embeds = message.embeds
-    target_user_id = None
-    if message.mentions:
-        target_user_id = message.mentions[0].id if message.mentions[0].id != OWO_BOT_ID else None
-
-    if not target_user_id or target_user_id not in active_sessions:
-        return
-
-    session = active_sessions[target_user_id]
-
-    # COINFLIP
-    if "spent :cowoncy:" in content and "chose" in content:
-        bet_amount = extract_amount(content)
-        if bet_amount:
-            pending_bets[target_user_id] = {
-                "game": "coinflip",
-                "amount": bet_amount,
-                "time": datetime.datetime.now(datetime.timezone.utc)
-            }
-            print(f"[Coinflip] Bet Placed: {bet_amount}")
-        return
-
-    if "the coin spins" in content:
-        if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "coinflip":
-            bet_info = pending_bets[target_user_id]
-            if "you lost it all" in content:
-                session["total_lost"] += bet_info["amount"]
-                print(f"[Coinflip] Lost: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
-            elif "you won" in content:
-                session["total_won"] += bet_info["amount"]
-                print(f"[Coinflip] Won: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
-            session["net_gain"] = session["total_won"] - session["total_lost"]
-            pending_bets.pop(target_user_id, None)
-        return
-
-    # SLOTS
-    if "___SLOTS___" in content and "bet :cowoncy:" in content:
-        bet_amount = extract_amount(content)
-        if bet_amount:
-            pending_bets[target_user_id] = {
-                "game": "slots",
-                "amount": bet_amount,
-                "time": datetime.datetime.now(datetime.timezone.utc)
-            }
-            print(f"[Slots] Bet Placed: {bet_amount}")
-        return
-
-    if "and won :cowoncy:" in content:
-        if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "slots":
-            bet_info = pending_bets[target_user_id]
-            won_amount = extract_amount(content)
-            if won_amount:
-                net_profit = won_amount - bet_info["amount"]
-                session["total_won"] += net_profit
-                print(f"[Slots] Won: {net_profit} (Bet: {bet_info['amount']}, Total: {won_amount}) | Net: {session['total_won'] - session['total_lost']}")
-                session["net_gain"] = session["total_won"] - session["total_lost"]
-                pending_bets.pop(target_user_id, None)
-        return
-
-    if "and lost it all" in content:
-        if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "slots":
-            bet_info = pending_bets[target_user_id]
-            session["total_lost"] += bet_info["amount"]
-            print(f"[Slots] Lost: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
-            session["net_gain"] = session["total_won"] - session["total_lost"]
-            pending_bets.pop(target_user_id, None)
-        return
-
-    # BLACKJACK
-    if embeds:
-        for embed in embeds:
-            description = embed.description or ""
-            footer = embed.footer.text if embed.footer else ""
-
-            if "you bet" in description.lower() and "to play blackjack" in description.lower():
-                bet_amount = extract_amount(description)
-                if bet_amount:
-                    pending_bets[target_user_id] = {
-                        "game": "blackjack",
-                        "amount": bet_amount,
-                        "time": datetime.datetime.now(datetime.timezone.utc)
-                    }
-                    print(f"[Blackjack] Bet Placed: {bet_amount}")
-                return
-
-            if "you won" in footer.lower():
-                if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "blackjack":
-                    net_profit = extract_amount(footer)
-                    if net_profit is not None:
-                        session["total_won"] += net_profit
-                        print(f"[Blackjack] Won: {net_profit} | Net: {session['total_won'] - session['total_lost']}")
-                        session["net_gain"] = session["total_won"] - session["total_lost"]
-                        pending_bets.pop(target_user_id, None)
-                return
-
-            if "you lost" in footer.lower():
-                if target_user_id in pending_bets and pending_bets[target_user_id]["game"] == "blackjack":
-                    bet_info = pending_bets[target_user_id]
-                    session["total_lost"] += bet_info["amount"]
-                    print(f"[Blackjack] Lost: {bet_info['amount']} | Net: {session['total_won'] - session['total_lost']}")
-                    session["net_gain"] = session["total_won"] - session["total_lost"]
-                    pending_bets.pop(target_user_id, None)
-                return
-
-            if "you tied" in footer.lower() or "you both bust" in footer.lower():
-                pending_bets.pop(target_user_id, None)
-                print("[Blackjack] Tie or Bust - No Change")
-                return
-
-bot.run(DISCORD_TOKEN)
+bot.run(BOT_TOKEN)
