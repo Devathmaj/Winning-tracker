@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:latest
+    container_name: mongodb_container
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: always
+
+  bot:
+    build: .
+    container_name: discord_bot_container
+    depends_on:
+      - mongo
+    env_file:
+      - .env
+    environment:
+      # This MONGO_URI uses the service name 'mongo' as the hostname,
+      # which is resolved by Docker's internal DNS.
+      MONGO_URI: mongodb://mongo:27017/
+    restart: always
+
+volumes:
+  mongo_data:
